@@ -2,13 +2,14 @@ use std::path::{Path, PathBuf};
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::w;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, LPARAM, MAX_PATH};
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::WindowsAndMessaging::EnumChildWindows;
 use windows::Win32::{
     Foundation::{HWND, RECT},
     UI::WindowsAndMessaging::{
@@ -26,6 +27,10 @@ struct LangCodePage {
     pub w_code_page: u16,
 }
 
+struct WindowInfo {
+    pub path: String,
+    pub name: String,
+}
 pub struct WindowsPlatformApi {}
 
 impl PlatformApi for WindowsPlatformApi {
@@ -46,7 +51,29 @@ impl PlatformApi for WindowsPlatformApi {
         let active_window_title = get_window_title(active_window)?;
         let mut lpdw_process_id: u32 = 0;
         unsafe { GetWindowThreadProcessId(active_window, &mut lpdw_process_id) };
-        let process_name = get_window_process_name(lpdw_process_id)?;
+        let win_info = get_window_process_path_and_name(lpdw_process_id)?;
+
+        let mut process_name = win_info.name;
+        
+        // ApplicationFrameHost & Universal Windows Platform Support
+        if get_name_from_path(&win_info.path) == "ApplicationFrameHost" {
+            let mut cb_info = callback_info {
+                name: process_name.clone(),
+                path: win_info.path.clone(),
+                child_win_name: String::new(),
+            };
+            let wininfo_ptr: *mut callback_info = &mut cb_info;
+            let lparam = LPARAM(wininfo_ptr as *mut std::ffi::c_void as isize);
+
+            unsafe {
+                let result =
+                    EnumChildWindows(active_window, Some(enum_child_window_callback), lparam);
+
+                if result.as_bool() == false && !cb_info.child_win_name.is_empty() {
+                    process_name = cb_info.child_win_name;
+                }
+            }
+        }
 
         let active_window = ActiveWindow {
             title: active_window_title,
@@ -58,6 +85,29 @@ impl PlatformApi for WindowsPlatformApi {
 
         Ok(active_window)
     }
+}
+
+#[repr(C)]
+struct callback_info {
+    name: String,
+    path: String,
+    child_win_name: String,
+}
+unsafe extern "system" fn enum_child_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // Return 1 to continue enumeration or 0 to stop enumeration
+
+    let mut lpdw_process_id: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut lpdw_process_id) };
+
+    let cb_info = lparam.0 as *mut std::ffi::c_void as *mut callback_info;
+
+    let win_info = get_window_process_path_and_name(lpdw_process_id).unwrap();
+
+    if win_info.path != (*cb_info).path {
+        (*cb_info).child_win_name = win_info.name;
+        return BOOL(0);
+    }
+    BOOL(1)
 }
 
 fn get_foreground_window() -> HWND {
@@ -110,25 +160,40 @@ fn get_process_path(process_handle: HANDLE) -> Result<PathBuf, ()> {
     Ok(Path::new(&process_path).to_path_buf())
 }
 
-fn get_window_process_name(process_id: u32) -> Result<String, ()> {
+fn get_name_from_path(path: &String) -> String {
+    Path::new(path)
+        .file_stem()
+        .unwrap_or(std::ffi::OsStr::new(""))
+        .to_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn get_window_process_path_and_name(process_id: u32) -> Result<WindowInfo, ()> {
     let process_handle = get_process_handle(process_id)?;
 
     let process_path = get_process_path(process_handle)?;
 
     close_process_handle(process_handle);
 
+    let mut process_name = String::new();
     if let Ok(file_description) = get_file_description(&process_path) {
-        return Ok(file_description);
+        process_name = file_description;
     }
 
-    let process_file_name = process_path
-        .file_stem()
-        .unwrap_or(std::ffi::OsStr::new(""))
-        .to_str()
-        .unwrap_or("")
-        .to_owned();
+    if process_name.is_empty() {
+        process_name = process_path
+            .file_stem()
+            .unwrap_or(std::ffi::OsStr::new(""))
+            .to_str()
+            .unwrap_or("")
+            .to_owned();
+    }
 
-    Ok(process_file_name)
+    Ok(WindowInfo {
+        name: process_name,
+        path: process_path.to_str().unwrap().to_string()
+    })
 }
 
 fn get_file_description(process_path: &PathBuf) -> Result<String, ()> {
